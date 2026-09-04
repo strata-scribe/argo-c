@@ -616,3 +616,112 @@ func TestReconciler_ExistingWebhook_Idempotent(t *testing.T) {
 		t.Fatalf("CreateWebhook should NOT be called when webhook already exists")
 	}
 }
+
+func TestDecodeAndRouteBitbucketCloud(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":123,"active":true,"config":{"url":"https://example.com/hook"}}`))
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+	desired := &Webhook{Active: true, Config: WebhookConfig{URL: "https://example.com/hook"}}
+
+	t.Run("ValidPayload", func(t *testing.T) {
+		payload := []byte(`{"repository":{"name":"my-repo","workspace":{"slug":"my-workspace"}}}`)
+		hook, err := reconciler.DecodeAndRouteBitbucketCloud(context.Background(), payload, desired)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if hook == nil || hook.ID != 123 {
+			t.Fatalf("expected hook ID 123, got: %+v", hook)
+		}
+	})
+
+	t.Run("InvalidJSON", func(t *testing.T) {
+		payload := []byte(`{"repository": { "name": "my-repo" `)
+		_, err := reconciler.DecodeAndRouteBitbucketCloud(context.Background(), payload, desired)
+		if err == nil {
+			t.Fatal("expected error for invalid json, got nil")
+		}
+	})
+
+	t.Run("MissingFields", func(t *testing.T) {
+		payload := []byte(`{"repository":{"name":"","workspace":{"slug":""}}}`)
+		_, err := reconciler.DecodeAndRouteBitbucketCloud(context.Background(), payload, desired)
+		if err == nil {
+			t.Fatal("expected error for missing fields, got nil")
+		}
+		if err.Error() != "missing owner or repo in bitbucket cloud payload" {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+}
+
+func TestDecodeAndRouteBitbucketServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":123,"active":true,"config":{"url":"https://example.com/hook"}}`))
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+	desired := &Webhook{Active: true, Config: WebhookConfig{URL: "https://example.com/hook"}}
+
+	t.Run("ValidPayloadWithSlug", func(t *testing.T) {
+		payload := []byte(`{"repository":{"slug":"my-repo","project":{"key":"PROJ"}}}`)
+		hook, err := reconciler.DecodeAndRouteBitbucketServer(context.Background(), payload, desired)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if hook == nil || hook.ID != 123 {
+			t.Fatalf("expected hook ID 123, got: %+v", hook)
+		}
+	})
+
+	t.Run("ValidPayloadWithName", func(t *testing.T) {
+		payload := []byte(`{"repository":{"name":"my-repo","project":{"key":"PROJ"}}}`)
+		hook, err := reconciler.DecodeAndRouteBitbucketServer(context.Background(), payload, desired)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if hook == nil || hook.ID != 123 {
+			t.Fatalf("expected hook ID 123, got: %+v", hook)
+		}
+	})
+
+	t.Run("InvalidJSON", func(t *testing.T) {
+		payload := []byte(`{"repository": { "slug": "my-repo" `)
+		_, err := reconciler.DecodeAndRouteBitbucketServer(context.Background(), payload, desired)
+		if err == nil {
+			t.Fatal("expected error for invalid json, got nil")
+		}
+	})
+
+	t.Run("MissingFields", func(t *testing.T) {
+		payload := []byte(`{"repository":{"slug":"","project":{"key":""}}}`)
+		_, err := reconciler.DecodeAndRouteBitbucketServer(context.Background(), payload, desired)
+		if err == nil {
+			t.Fatal("expected error for missing fields, got nil")
+		}
+		if err.Error() != "missing owner or repo in bitbucket server payload" {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+}
