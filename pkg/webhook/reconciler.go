@@ -23,6 +23,17 @@ var (
 	ErrRateLimited = errors.New("github api rate limited")
 	// ErrServerError indicates a GitHub server-side failure (HTTP 5xx).
 	ErrServerError = errors.New("github api server error")
+
+	// ErrGitLabWebhookNotFound indicates that the requested GitLab webhook does not exist (HTTP 404).
+	ErrGitLabWebhookNotFound = errors.New("gitlab webhook not found")
+	// ErrGitLabUnauthorized indicates invalid GitLab authentication credentials (HTTP 401).
+	ErrGitLabUnauthorized = errors.New("gitlab api unauthorized: check token/credentials")
+	// ErrGitLabForbidden indicates insufficient permissions for GitLab API (HTTP 403).
+	ErrGitLabForbidden = errors.New("gitlab api forbidden: check repository permissions")
+	// ErrGitLabRateLimited indicates GitLab API rate limit was exceeded (HTTP 429).
+	ErrGitLabRateLimited = errors.New("gitlab api rate limited")
+	// ErrGitLabServerError indicates a GitLab server-side failure (HTTP 5xx).
+	ErrGitLabServerError = errors.New("gitlab api server error")
 )
 
 // WebhookConfig represents the configuration payload for a GitHub webhook.
@@ -42,11 +53,170 @@ type Webhook struct {
 	Config WebhookConfig `json:"config"`
 }
 
+// GitLabWebhook represents a GitLab repository webhook.
+type GitLabWebhook struct {
+	ID                    int64  `json:"id,omitempty"`
+	URL                   string `json:"url,omitempty"`
+	PushEvents            bool   `json:"push_events,omitempty"`
+	TagPushEvents         bool   `json:"tag_push_events,omitempty"`
+	Token                 string `json:"token,omitempty"`
+	EnableSSLVerification bool   `json:"enable_ssl_verification,omitempty"`
+}
+
 // GitHubClient defines the client contract for GitHub webhook operations.
 type GitHubClient interface {
 	GetWebhook(ctx context.Context, owner, repo string, hookID int64) (*Webhook, error)
 	ListWebhooks(ctx context.Context, owner, repo string) ([]*Webhook, error)
 	CreateWebhook(ctx context.Context, owner, repo string, hook *Webhook) (*Webhook, error)
+}
+
+// GitLabClient defines the client contract for GitLab webhook operations.
+type GitLabClient interface {
+	GetWebhook(ctx context.Context, projectID string, hookID int64) (*GitLabWebhook, error)
+	ListWebhooks(ctx context.Context, projectID string) ([]*GitLabWebhook, error)
+	CreateWebhook(ctx context.Context, projectID string, hook *GitLabWebhook) (*GitLabWebhook, error)
+}
+
+// HTTPGitLabClient implements GitLabClient using standard HTTP requests.
+type HTTPGitLabClient struct {
+	BaseURL    string
+	Token      string
+	HTTPClient *http.Client
+}
+
+// NewHTTPGitLabClient creates a new HTTP-based GitLab API client.
+func NewHTTPGitLabClient(baseURL, token string, httpClient *http.Client) *HTTPGitLabClient {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	return &HTTPGitLabClient{
+		BaseURL:    baseURL,
+		Token:      token,
+		HTTPClient: httpClient,
+	}
+}
+
+func (c *HTTPGitLabClient) newRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+
+	reqURL := fmt.Sprintf("%s%s", c.BaseURL, path)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	if c.Token != "" {
+		req.Header.Set("PRIVATE-TOKEN", c.Token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+func (c *HTTPGitLabClient) checkResponseError(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return ErrGitLabWebhookNotFound
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: status %d body: %s", ErrGitLabUnauthorized, resp.StatusCode, string(body))
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: status %d body: %s", ErrGitLabForbidden, resp.StatusCode, string(body))
+	case http.StatusTooManyRequests:
+		return fmt.Errorf("%w: status %d body: %s", ErrGitLabRateLimited, resp.StatusCode, string(body))
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return fmt.Errorf("%w: status %d body: %s", ErrGitLabServerError, resp.StatusCode, string(body))
+	default:
+		return fmt.Errorf("gitlab api error: status %d body: %s", resp.StatusCode, string(body))
+	}
+}
+
+// GetWebhook retrieves a specific webhook by ID.
+func (c *HTTPGitLabClient) GetWebhook(ctx context.Context, projectID string, hookID int64) (*GitLabWebhook, error) {
+	path := fmt.Sprintf("/projects/%s/hooks/%d", projectID, hookID)
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error querying gitlab webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := c.checkResponseError(resp); err != nil {
+		return nil, err
+	}
+
+	var hook GitLabWebhook
+	if err := json.NewDecoder(resp.Body).Decode(&hook); err != nil {
+		return nil, fmt.Errorf("failed to decode webhook response: %w", err)
+	}
+	return &hook, nil
+}
+
+// ListWebhooks retrieves all webhooks for a repository.
+func (c *HTTPGitLabClient) ListWebhooks(ctx context.Context, projectID string) ([]*GitLabWebhook, error) {
+	path := fmt.Sprintf("/projects/%s/hooks", projectID)
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error listing gitlab webhooks: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := c.checkResponseError(resp); err != nil {
+		return nil, err
+	}
+
+	var hooks []*GitLabWebhook
+	if err := json.NewDecoder(resp.Body).Decode(&hooks); err != nil {
+		return nil, fmt.Errorf("failed to decode webhooks response: %w", err)
+	}
+	return hooks, nil
+}
+
+// CreateWebhook creates a new webhook for a repository.
+func (c *HTTPGitLabClient) CreateWebhook(ctx context.Context, projectID string, hook *GitLabWebhook) (*GitLabWebhook, error) {
+	path := fmt.Sprintf("/projects/%s/hooks", projectID)
+	req, err := c.newRequest(ctx, http.MethodPost, path, hook)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error creating gitlab webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := c.checkResponseError(resp); err != nil {
+		return nil, err
+	}
+
+	var created GitLabWebhook
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return nil, fmt.Errorf("failed to decode created webhook response: %w", err)
+	}
+	return &created, nil
 }
 
 // HTTPGitHubClient implements GitHubClient using standard HTTP requests.
@@ -251,4 +421,65 @@ func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired 
 	// Webhook does not exist in the list; safely create it
 	r.logger.Printf("Webhook not found in list for %s/%s; creating new webhook", owner, repo)
 	return r.client.CreateWebhook(ctx, owner, repo, desired)
+}
+
+// GitLabReconciler manages the lifecycle and reconciliation of GitLab webhooks.
+type GitLabReconciler struct {
+	client GitLabClient
+	logger *log.Logger
+}
+
+// NewGitLabReconciler creates a new GitLab webhook reconciler.
+func NewGitLabReconciler(client GitLabClient, logger *log.Logger) *GitLabReconciler {
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
+	return &GitLabReconciler{
+		client: client,
+		logger: logger,
+	}
+}
+
+// Reconcile ensures the desired webhook exists on the target repository.
+// If the webhook retrieval indicates 404 (ErrGitLabWebhookNotFound), it creates the webhook.
+// Non-404 errors (5xx, 429, 401, 403, network timeouts) are propagated immediately
+// without attempting creation to prevent duplicate webhooks and masking critical errors.
+func (r *GitLabReconciler) Reconcile(ctx context.Context, projectID string, desired *GitLabWebhook) (*GitLabWebhook, error) {
+	hooks, err := r.client.ListWebhooks(ctx, projectID)
+	if err != nil {
+		if errors.Is(err, ErrGitLabWebhookNotFound) {
+			r.logger.Printf("Webhooks endpoint returned 404 for project %s; creating new webhook", projectID)
+			return r.client.CreateWebhook(ctx, projectID, desired)
+		}
+
+		if errors.Is(err, ErrGitLabUnauthorized) || errors.Is(err, ErrGitLabForbidden) {
+			r.logger.Printf("Authentication/Authorization failure for project %s: %v", projectID, err)
+			return nil, fmt.Errorf("permission error reconciling webhook for project %s: %w", projectID, err)
+		}
+
+		if errors.Is(err, ErrGitLabRateLimited) {
+			r.logger.Printf("Rate limit encountered while reconciling project %s: %v", projectID, err)
+			return nil, fmt.Errorf("rate limit exceeded reconciling webhook for project %s: %w", projectID, err)
+		}
+
+		if errors.Is(err, ErrGitLabServerError) {
+			r.logger.Printf("GitLab server error encountered while reconciling project %s: %v", projectID, err)
+			return nil, fmt.Errorf("gitlab server error reconciling webhook for project %s: %w", projectID, err)
+		}
+
+		r.logger.Printf("Error fetching webhooks for project %s: %v", projectID, err)
+		return nil, fmt.Errorf("failed to list webhooks for project %s: %w", projectID, err)
+	}
+
+	// Look for an existing webhook with the matching URL
+	for _, h := range hooks {
+		if h.URL == desired.URL {
+			r.logger.Printf("Webhook already exists for project %s (ID: %d)", projectID, h.ID)
+			return h, nil
+		}
+	}
+
+	// Webhook does not exist in the list; safely create it
+	r.logger.Printf("Webhook not found in list for project %s; creating new webhook", projectID)
+	return r.client.CreateWebhook(ctx, projectID, desired)
 }
