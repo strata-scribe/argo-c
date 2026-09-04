@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var (
@@ -364,8 +365,10 @@ func (c *HTTPGitHubClient) CreateWebhook(ctx context.Context, owner, repo string
 
 // Reconciler manages the lifecycle and reconciliation of GitHub webhooks.
 type Reconciler struct {
-	client GitHubClient
-	logger *log.Logger
+	client     GitHubClient
+	logger     *log.Logger
+	maxRetries int
+	baseDelay  time.Duration
 }
 
 // NewReconciler creates a new webhook reconciler.
@@ -374,16 +377,46 @@ func NewReconciler(client GitHubClient, logger *log.Logger) *Reconciler {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Reconciler{
-		client: client,
-		logger: logger,
+		client:     client,
+		logger:     logger,
+		maxRetries: 3,
+		baseDelay:  time.Second,
 	}
 }
 
 // Reconcile ensures the desired webhook exists on the target repository.
 // If the webhook retrieval indicates 404 (ErrWebhookNotFound), it creates the webhook.
-// Non-404 errors (5xx, 429, 401, 403, network timeouts) are propagated immediately
+// Non-404 errors (5xx, 401, 403, network timeouts) are propagated immediately
 // without attempting creation to prevent duplicate webhooks and masking critical errors.
+// ErrRateLimited (429) triggers exponential backoff and retry up to maxRetries.
 func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired *Webhook) (*Webhook, error) {
+	delay := r.baseDelay
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		hook, err := r.doReconcile(ctx, owner, repo, desired)
+		if err == nil {
+			return hook, nil
+		}
+
+		if !errors.Is(err, ErrRateLimited) || attempt == r.maxRetries {
+			return nil, err
+		}
+
+		r.logger.Printf("Rate limit encountered for %s/%s (attempt %d/%d), retrying in %v...", owner, repo, attempt+1, r.maxRetries, delay)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+	}
+
+	// Should not be reached
+	return nil, fmt.Errorf("unexpected end of retry loop")
+}
+
+func (r *Reconciler) doReconcile(ctx context.Context, owner, repo string, desired *Webhook) (*Webhook, error) {
 	hooks, err := r.client.ListWebhooks(ctx, owner, repo)
 	if err != nil {
 		if errors.Is(err, ErrWebhookNotFound) {
@@ -397,7 +430,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired 
 		}
 
 		if errors.Is(err, ErrRateLimited) {
-			r.logger.Printf("Rate limit encountered while reconciling %s/%s: %v", owner, repo, err)
+			// Do not log rate limit as error here, wait for retry loop
 			return nil, fmt.Errorf("rate limit exceeded reconciling webhook for %s/%s: %w", owner, repo, err)
 		}
 
