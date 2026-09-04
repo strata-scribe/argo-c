@@ -42,6 +42,27 @@ type Webhook struct {
 	Config WebhookConfig `json:"config"`
 }
 
+// BitbucketCloudPayload represents the minimal JSON payload from a Bitbucket Cloud webhook.
+type BitbucketCloudPayload struct {
+	Repository struct {
+		Name      string `json:"name"`
+		Workspace struct {
+			Slug string `json:"slug"`
+		} `json:"workspace"`
+	} `json:"repository"`
+}
+
+// BitbucketServerPayload represents the minimal JSON payload from a Bitbucket Server webhook.
+type BitbucketServerPayload struct {
+	Repository struct {
+		Slug    string `json:"slug"`
+		Name    string `json:"name"`
+		Project struct {
+			Key string `json:"key"`
+		} `json:"project"`
+	} `json:"repository"`
+}
+
 // GitHubClient defines the client contract for GitHub webhook operations.
 type GitHubClient interface {
 	GetWebhook(ctx context.Context, owner, repo string, hookID int64) (*Webhook, error)
@@ -251,4 +272,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired 
 	// Webhook does not exist in the list; safely create it
 	r.logger.Printf("Webhook not found in list for %s/%s; creating new webhook", owner, repo)
 	return r.client.CreateWebhook(ctx, owner, repo, desired)
+}
+
+// DecodeAndRouteBitbucketCloud decodes a Bitbucket Cloud webhook payload and routes it to the reconciliation loop.
+func (r *Reconciler) DecodeAndRouteBitbucketCloud(ctx context.Context, payload []byte, desired *Webhook) (*Webhook, error) {
+	var p BitbucketCloudPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("failed to decode bitbucket cloud payload: %w", err)
+	}
+
+	owner := p.Repository.Workspace.Slug
+	repo := p.Repository.Name
+
+	if owner == "" || repo == "" {
+		return nil, errors.New("missing owner or repo in bitbucket cloud payload")
+	}
+
+	return r.Reconcile(ctx, owner, repo, desired)
+}
+
+// DecodeAndRouteBitbucketServer decodes a Bitbucket Server webhook payload and routes it to the reconciliation loop.
+func (r *Reconciler) DecodeAndRouteBitbucketServer(ctx context.Context, payload []byte, desired *Webhook) (*Webhook, error) {
+	var p BitbucketServerPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("failed to decode bitbucket server payload: %w", err)
+	}
+
+	owner := p.Repository.Project.Key
+	repo := p.Repository.Slug
+	if repo == "" {
+		repo = p.Repository.Name
+	}
+
+	if owner == "" || repo == "" {
+		return nil, errors.New("missing owner or repo in bitbucket server payload")
+	}
+
+	return r.Reconcile(ctx, owner, repo, desired)
 }
