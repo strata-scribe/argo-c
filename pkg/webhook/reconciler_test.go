@@ -31,6 +31,7 @@ func TestReconciler_NotFound_CreatesWebhook(t *testing.T) {
 
 	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
 	reconciler := NewReconciler(client, nil)
+	reconciler.baseDelay = time.Millisecond
 
 	desired := &Webhook{
 		Active: true,
@@ -81,31 +82,34 @@ func TestReconciler_ServerError_HaltsWithoutCreation(t *testing.T) {
 
 			client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
 			reconciler := NewReconciler(client, nil)
+			reconciler.baseDelay = time.Millisecond
 
-		desired := &Webhook{
-			Active: true,
-			Config: WebhookConfig{URL: "https://example.com/hook"},
-		}
+			desired := &Webhook{
+				Active: true,
+				Config: WebhookConfig{URL: "https://example.com/hook"},
+			}
 
-		_, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
-		if err == nil {
-			t.Fatalf("expected error for status %d, got nil", tc.statusCode)
-		}
-		if !errors.Is(err, ErrServerError) {
-			t.Fatalf("expected ErrServerError, got: %v", err)
-		}
-		if atomic.LoadInt32(&createCalled) != 0 {
-			t.Fatalf("CreateWebhook should NOT be called on server error %d", tc.statusCode)
-		}
+			_, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+			if err == nil {
+				t.Fatalf("expected error for status %d, got nil", tc.statusCode)
+			}
+			if !errors.Is(err, ErrServerError) {
+				t.Fatalf("expected ErrServerError, got: %v", err)
+			}
+			if atomic.LoadInt32(&createCalled) != 0 {
+				t.Fatalf("CreateWebhook should NOT be called on server error %d", tc.statusCode)
+			}
 		})
 	}
 }
 
 func TestReconciler_RateLimited_HaltsWithoutCreation(t *testing.T) {
 	var createCalled int32
+	var getCalled int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
+			atomic.AddInt32(&getCalled, 1)
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
 			return
@@ -120,6 +124,8 @@ func TestReconciler_RateLimited_HaltsWithoutCreation(t *testing.T) {
 
 	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
 	reconciler := NewReconciler(client, nil)
+	reconciler.maxRetries = 0 // Disable retries for this test
+	reconciler.baseDelay = time.Millisecond
 
 	desired := &Webhook{
 		Active: true,
@@ -135,6 +141,100 @@ func TestReconciler_RateLimited_HaltsWithoutCreation(t *testing.T) {
 	}
 	if atomic.LoadInt32(&createCalled) != 0 {
 		t.Fatalf("CreateWebhook should NOT be called on 429 Rate Limit")
+	}
+	if atomic.LoadInt32(&getCalled) != 1 {
+		t.Fatalf("Expected exactly 1 get call, got %d", getCalled)
+	}
+}
+
+func TestReconciler_RetriesOnRateLimit_ExceedsMaxRetries(t *testing.T) {
+	var getCalled int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			atomic.AddInt32(&getCalled, 1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+	reconciler.maxRetries = 3
+	reconciler.baseDelay = time.Millisecond
+
+	desired := &Webhook{
+		Active: true,
+		Config: WebhookConfig{URL: "https://example.com/hook"},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+	if err == nil {
+		t.Fatalf("expected rate limit error, got nil")
+	}
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected ErrRateLimited, got: %v", err)
+	}
+
+	// Should be 1 initial attempt + 3 retries = 4 attempts total
+	expectedCalls := int32(4)
+	if atomic.LoadInt32(&getCalled) != expectedCalls {
+		t.Fatalf("expected %d get calls due to retries, got %d", expectedCalls, getCalled)
+	}
+}
+
+func TestReconciler_RetriesOnRateLimit_SuccessAfterRetries(t *testing.T) {
+	var getCalled int32
+	var createCalled int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			calls := atomic.AddInt32(&getCalled, 1)
+			if calls <= 2 {
+				// Fail the first two times with RateLimit
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"message":"API rate limit exceeded"}`))
+				return
+			}
+			// Succeed on the third attempt
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":456,"active":true,"config":{"url":"https://example.com/hook"}}]`))
+			return
+		}
+		if r.Method == http.MethodPost {
+			atomic.AddInt32(&createCalled, 1)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+	reconciler.maxRetries = 3
+	reconciler.baseDelay = time.Millisecond
+
+	desired := &Webhook{
+		Active: true,
+		Config: WebhookConfig{URL: "https://example.com/hook"},
+	}
+
+	hook, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hook == nil || hook.ID != 456 {
+		t.Fatalf("expected existing hook ID 456, got: %+v", hook)
+	}
+
+	expectedGetCalls := int32(3) // 2 failures + 1 success
+	if atomic.LoadInt32(&getCalled) != expectedGetCalls {
+		t.Fatalf("expected %d get calls, got %d", expectedGetCalls, getCalled)
+	}
+	if atomic.LoadInt32(&createCalled) != 0 {
+		t.Fatalf("CreateWebhook should NOT be called since webhook was found")
 	}
 }
 
@@ -168,22 +268,23 @@ func TestReconciler_AuthErrors_HaltsWithoutCreation(t *testing.T) {
 
 			client := NewHTTPGitHubClient(server.URL, "invalid-token", server.Client())
 			reconciler := NewReconciler(client, nil)
+			reconciler.baseDelay = time.Millisecond
 
-		desired := &Webhook{
-			Active: true,
-			Config: WebhookConfig{URL: "https://example.com/hook"},
-		}
+			desired := &Webhook{
+				Active: true,
+				Config: WebhookConfig{URL: "https://example.com/hook"},
+			}
 
-		_, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
-		if err == nil {
-			t.Fatalf("expected auth error for %s, got nil", tc.name)
-		}
-		if !errors.Is(err, tc.expectedErr) {
-			t.Fatalf("expected %v, got: %v", tc.expectedErr, err)
-		}
-		if atomic.LoadInt32(&createCalled) != 0 {
-			t.Fatalf("CreateWebhook should NOT be called on auth error %d", tc.statusCode)
-		}
+			_, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+			if err == nil {
+				t.Fatalf("expected auth error for %s, got nil", tc.name)
+			}
+			if !errors.Is(err, tc.expectedErr) {
+				t.Fatalf("expected %v, got: %v", tc.expectedErr, err)
+			}
+			if atomic.LoadInt32(&createCalled) != 0 {
+				t.Fatalf("CreateWebhook should NOT be called on auth error %d", tc.statusCode)
+			}
 		})
 	}
 }
@@ -208,6 +309,7 @@ func TestReconciler_Timeout_HaltsWithoutCreation(t *testing.T) {
 
 	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
 	reconciler := NewReconciler(client, nil)
+	reconciler.baseDelay = time.Millisecond
 
 	desired := &Webhook{
 		Active: true,
@@ -245,6 +347,7 @@ func TestReconciler_ExistingWebhook_Idempotent(t *testing.T) {
 
 	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
 	reconciler := NewReconciler(client, nil)
+	reconciler.baseDelay = time.Millisecond
 
 	desired := &Webhook{
 		Active: true,
