@@ -47,6 +47,8 @@ type GitHubClient interface {
 	GetWebhook(ctx context.Context, owner, repo string, hookID int64) (*Webhook, error)
 	ListWebhooks(ctx context.Context, owner, repo string) ([]*Webhook, error)
 	CreateWebhook(ctx context.Context, owner, repo string, hook *Webhook) (*Webhook, error)
+	UpdateWebhook(ctx context.Context, owner, repo string, hook *Webhook) (*Webhook, error)
+	DeleteWebhook(ctx context.Context, owner, repo string, hookID int64) error
 }
 
 // HTTPGitHubClient implements GitHubClient using standard HTTP requests.
@@ -192,6 +194,48 @@ func (c *HTTPGitHubClient) CreateWebhook(ctx context.Context, owner, repo string
 	return &created, nil
 }
 
+// UpdateWebhook updates an existing webhook for a repository.
+func (c *HTTPGitHubClient) UpdateWebhook(ctx context.Context, owner, repo string, hook *Webhook) (*Webhook, error) {
+	path := fmt.Sprintf("/repos/%s/%s/hooks/%d", owner, repo, hook.ID)
+	req, err := c.newRequest(ctx, http.MethodPatch, path, hook)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error updating github webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := c.checkResponseError(resp); err != nil {
+		return nil, err
+	}
+
+	var updated Webhook
+	if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil {
+		return nil, fmt.Errorf("failed to decode updated webhook response: %w", err)
+	}
+	return &updated, nil
+}
+
+// DeleteWebhook deletes an existing webhook for a repository.
+func (c *HTTPGitHubClient) DeleteWebhook(ctx context.Context, owner, repo string, hookID int64) error {
+	path := fmt.Sprintf("/repos/%s/%s/hooks/%d", owner, repo, hookID)
+	req, err := c.newRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("network error deleting github webhook: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return c.checkResponseError(resp)
+}
+
 // Reconciler manages the lifecycle and reconciliation of GitHub webhooks.
 type Reconciler struct {
 	client GitHubClient
@@ -244,6 +288,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired 
 	for _, h := range hooks {
 		if h.Config.URL == desired.Config.URL {
 			r.logger.Printf("Webhook already exists for %s/%s (ID: %d)", owner, repo, h.ID)
+
+			// Compare configuration to see if it needs updating
+			if h.Active != desired.Active || !eventsEqual(h.Events, desired.Events) {
+				r.logger.Printf("Webhook configuration differs for %s/%s (ID: %d); updating webhook", owner, repo, h.ID)
+				desired.ID = h.ID // Ensure we have the correct ID for the update payload
+				return r.client.UpdateWebhook(ctx, owner, repo, desired)
+			}
+
 			return h, nil
 		}
 	}
@@ -251,4 +303,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, owner, repo string, desired 
 	// Webhook does not exist in the list; safely create it
 	r.logger.Printf("Webhook not found in list for %s/%s; creating new webhook", owner, repo)
 	return r.client.CreateWebhook(ctx, owner, repo, desired)
+}
+
+func eventsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create maps to easily check presence of events regardless of order
+	aMap := make(map[string]struct{}, len(a))
+	for _, event := range a {
+		aMap[event] = struct{}{}
+	}
+
+	for _, event := range b {
+		if _, ok := aMap[event]; !ok {
+			return false
+		}
+	}
+
+	return true
 }

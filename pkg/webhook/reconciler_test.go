@@ -10,6 +10,60 @@ import (
 	"time"
 )
 
+func TestHTTPGitHubClient_UpdateWebhook(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			t.Errorf("expected PATCH method, got %s", r.Method)
+		}
+		if r.URL.Path != "/repos/owner/repo/hooks/123" {
+			t.Errorf("expected path /repos/owner/repo/hooks/123, got %s", r.URL.Path)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":123,"active":true,"events":["push","pull_request"],"config":{"url":"https://example.com/hook"}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+
+	hook := &Webhook{
+		ID:     123,
+		Active: true,
+		Events: []string{"push", "pull_request"},
+		Config: WebhookConfig{URL: "https://example.com/hook"},
+	}
+
+	updated, err := client.UpdateWebhook(context.Background(), "owner", "repo", hook)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if updated.ID != 123 || !updated.Active || len(updated.Events) != 2 {
+		t.Fatalf("unexpected updated webhook: %+v", updated)
+	}
+}
+
+func TestHTTPGitHubClient_DeleteWebhook(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("expected DELETE method, got %s", r.Method)
+		}
+		if r.URL.Path != "/repos/owner/repo/hooks/123" {
+			t.Errorf("expected path /repos/owner/repo/hooks/123, got %s", r.URL.Path)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+
+	err := client.DeleteWebhook(context.Background(), "owner", "repo", 123)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestReconciler_NotFound_CreatesWebhook(t *testing.T) {
 	var createCalled int32
 
@@ -228,16 +282,22 @@ func TestReconciler_Timeout_HaltsWithoutCreation(t *testing.T) {
 
 func TestReconciler_ExistingWebhook_Idempotent(t *testing.T) {
 	var createCalled int32
+	var updateCalled int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`[{"id":456,"active":true,"config":{"url":"https://example.com/hook"}}]`))
+			_, _ = w.Write([]byte(`[{"id":456,"active":true,"events":["push"],"config":{"url":"https://example.com/hook"}}]`))
 			return
 		}
 		if r.Method == http.MethodPost {
 			atomic.AddInt32(&createCalled, 1)
 			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		if r.Method == http.MethodPatch {
+			atomic.AddInt32(&updateCalled, 1)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}))
@@ -248,6 +308,7 @@ func TestReconciler_ExistingWebhook_Idempotent(t *testing.T) {
 
 	desired := &Webhook{
 		Active: true,
+		Events: []string{"push"},
 		Config: WebhookConfig{URL: "https://example.com/hook"},
 	}
 
@@ -260,5 +321,88 @@ func TestReconciler_ExistingWebhook_Idempotent(t *testing.T) {
 	}
 	if atomic.LoadInt32(&createCalled) != 0 {
 		t.Fatalf("CreateWebhook should NOT be called when webhook already exists")
+	}
+	if atomic.LoadInt32(&updateCalled) != 0 {
+		t.Fatalf("UpdateWebhook should NOT be called when webhook matches")
+	}
+}
+
+func TestReconciler_ExistingWebhook_UpdatesActiveState(t *testing.T) {
+	var updateCalled int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":456,"active":false,"events":["push"],"config":{"url":"https://example.com/hook"}}]`))
+			return
+		}
+		if r.Method == http.MethodPatch {
+			atomic.AddInt32(&updateCalled, 1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":456,"active":true,"events":["push"],"config":{"url":"https://example.com/hook"}}`))
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+
+	// Desired state is Active: true, but existing is Active: false
+	desired := &Webhook{
+		Active: true,
+		Events: []string{"push"},
+		Config: WebhookConfig{URL: "https://example.com/hook"},
+	}
+
+	hook, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hook == nil || hook.ID != 456 || !hook.Active {
+		t.Fatalf("expected updated hook ID 456 with active=true, got: %+v", hook)
+	}
+	if atomic.LoadInt32(&updateCalled) != 1 {
+		t.Fatalf("UpdateWebhook should be called once when Active state differs")
+	}
+}
+
+func TestReconciler_ExistingWebhook_UpdatesEvents(t *testing.T) {
+	var updateCalled int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":456,"active":true,"events":["push"],"config":{"url":"https://example.com/hook"}}]`))
+			return
+		}
+		if r.Method == http.MethodPatch {
+			atomic.AddInt32(&updateCalled, 1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":456,"active":true,"events":["push","pull_request"],"config":{"url":"https://example.com/hook"}}`))
+			return
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPGitHubClient(server.URL, "test-token", server.Client())
+	reconciler := NewReconciler(client, nil)
+
+	// Desired state has more events
+	desired := &Webhook{
+		Active: true,
+		Events: []string{"push", "pull_request"},
+		Config: WebhookConfig{URL: "https://example.com/hook"},
+	}
+
+	hook, err := reconciler.Reconcile(context.Background(), "owner", "repo", desired)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hook == nil || hook.ID != 456 || len(hook.Events) != 2 {
+		t.Fatalf("expected updated hook ID 456 with 2 events, got: %+v", hook)
+	}
+	if atomic.LoadInt32(&updateCalled) != 1 {
+		t.Fatalf("UpdateWebhook should be called once when Events differ")
 	}
 }
