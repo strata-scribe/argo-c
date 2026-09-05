@@ -85,6 +85,18 @@ type BitbucketServerPayload struct {
 	} `json:"repository"`
 }
 
+// AzureDevOpsPayload represents the minimal JSON payload from an Azure DevOps webhook.
+type AzureDevOpsPayload struct {
+	Resource struct {
+		Repository struct {
+			Name    string `json:"name"`
+			Project struct {
+				Name string `json:"name"`
+			} `json:"project"`
+		} `json:"repository"`
+	} `json:"resource"`
+}
+
 // GitHubClient defines the client contract for GitHub webhook operations.
 type GitHubClient interface {
 	GetWebhook(ctx context.Context, owner, repo string, hookID int64) (*Webhook, error)
@@ -602,6 +614,40 @@ func (r *Reconciler) DecodeAndRouteBitbucketCloud(ctx context.Context, payload [
 
 	if owner == "" || repo == "" {
 		return nil, errors.New("missing owner or repo in bitbucket cloud payload")
+	}
+
+	return r.Reconcile(ctx, owner, repo, desired)
+}
+
+// DecodeAndRouteAzureDevOpsGitPush decodes an Azure DevOps git push webhook payload and routes it to the reconciliation loop.
+func (r *Reconciler) DecodeAndRouteAzureDevOpsGitPush(ctx context.Context, payload []byte, desired *Webhook) (*Webhook, error) {
+	var p AzureDevOpsPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("failed to decode azure devops git push payload: %w", err)
+	}
+
+	owner := p.Resource.Repository.Project.Name
+	repo := p.Resource.Repository.Name
+
+	if owner == "" || repo == "" {
+		return nil, errors.New("missing owner or repo in azure devops git push payload")
+	}
+
+	return r.Reconcile(ctx, owner, repo, desired)
+}
+
+// DecodeAndRouteAzureDevOpsPullRequest decodes an Azure DevOps pull request webhook payload and routes it to the reconciliation loop.
+func (r *Reconciler) DecodeAndRouteAzureDevOpsPullRequest(ctx context.Context, payload []byte, desired *Webhook) (*Webhook, error) {
+	var p AzureDevOpsPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("failed to decode azure devops pull request payload: %w", err)
+	}
+
+	owner := p.Resource.Repository.Project.Name
+	repo := p.Resource.Repository.Name
+
+	if owner == "" || repo == "" {
+		return nil, errors.New("missing owner or repo in azure devops pull request payload")
 	}
 
 	return r.Reconcile(ctx, owner, repo, desired)
