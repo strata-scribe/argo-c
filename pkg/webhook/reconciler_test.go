@@ -315,7 +315,6 @@ func TestHTTPGitHubClient_DeleteWebhook(t *testing.T) {
 	}
 }
 
-
 func TestReconciler_NotFound_CreatesWebhook(t *testing.T) {
 	var createCalled int32
 
