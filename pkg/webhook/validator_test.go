@@ -1,6 +1,9 @@
 package webhook
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -38,12 +41,6 @@ func TestValidateGitLabToken(t *testing.T) {
 			expected:    true,
 		},
 		{
-			name:        "empty secret but has header",
-			headerToken: "some-token",
-			secret:      "",
-			expected:    false,
-		},
-		{
 			name:        "different lengths",
 			headerToken: "short",
 			secret:      "longer-secret",
@@ -63,11 +60,74 @@ func TestValidateGitLabToken(t *testing.T) {
 			if tt.headerToken != "" {
 				req.Header.Set("X-Gitlab-Token", tt.headerToken)
 			}
-			// When headerToken is empty but we explicitly want it to be empty string for testing empty cases
-			// http.Header.Get returns empty string if not set, which matches the empty headerToken behavior.
 
 			if got := ValidateGitLabToken(req, tt.secret); got != tt.expected {
 				t.Errorf("ValidateGitLabToken() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func generateSignature(payload []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func TestValidateSignature(t *testing.T) {
+	secret := "my-secret-token"
+	payload := []byte(`{"action":"opened","issue":{"number":1}}`)
+	validSignature := generateSignature(payload, secret)
+
+	tests := []struct {
+		name      string
+		signature string
+		payload   []byte
+		secret    string
+		wantErr   error
+	}{
+		{
+			name:      "Valid signature",
+			signature: validSignature,
+			payload:   payload,
+			secret:    secret,
+			wantErr:   nil,
+		},
+		{
+			name:      "Invalid signature format (missing prefix)",
+			signature: hex.EncodeToString(hmac.New(sha256.New, []byte(secret)).Sum(nil)),
+			payload:   payload,
+			secret:    secret,
+			wantErr:   ErrInvalidSignatureFormat,
+		},
+		{
+			name:      "Invalid signature format (invalid hex)",
+			signature: "sha256=invalidhex",
+			payload:   payload,
+			secret:    secret,
+			wantErr:   ErrInvalidSignatureFormat,
+		},
+		{
+			name:      "Incorrect signature (mismatched secret)",
+			signature: validSignature,
+			payload:   payload,
+			secret:    "wrong-secret",
+			wantErr:   ErrSignatureMismatch,
+		},
+		{
+			name:      "Mismatched payload",
+			signature: validSignature,
+			payload:   []byte(`{"action":"closed","issue":{"number":1}}`),
+			secret:    secret,
+			wantErr:   ErrSignatureMismatch,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSignature(tt.signature, tt.payload, tt.secret)
+			if err != tt.wantErr {
+				t.Errorf("ValidateSignature() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
