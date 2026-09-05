@@ -1,0 +1,32 @@
+version: 2
+
+project_name: argo-c
+
+builds:
+  - main: ./main.go
+    binary: argo-c
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: amd64
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+release:
+  draft: false
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
